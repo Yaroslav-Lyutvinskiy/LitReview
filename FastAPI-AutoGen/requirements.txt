@@ -1,0 +1,7 @@
+uvicorn[standard]==0.35.0
+gunicorn==23.0.0
+fastapi[all]==0.116.0
+scikit-learn==1.7.2
+autogen-agentchat==0.7.5
+autogen-ext==0.7.5
+autogen-ext[openai]==0.7.5
