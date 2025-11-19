@@ -1,21 +1,27 @@
 import sys
 
 from fastapi import FastAPI
+from dotenv import load_dotenv
+import os
 
 from autogen_ext.models.openai import OpenAIChatCompletionClient
-from autogen_agentchat.teams import MagenticOneGroupChat
-from autogen_agentchat.ui import Console
-from autogen_ext.agents.web_surfer import MultimodalWebSurfer
 
-api_key = "<YOUR_API_KEY>"
+
+load_dotenv("./.env")
+openai_api_key = os.environ.get("OPENAI_API_KEY")
+
+from app.agents import init_team, run_team
+
 model_client = OpenAIChatCompletionClient(
     model="gpt-4o",
-    api_key = api_key
+    api_key = openai_api_key
 )
+
 
 version = f"{sys.version_info.major}.{sys.version_info.minor}"
 
 app = FastAPI()
+team = None
 
 
 @app.get("/")
@@ -23,20 +29,16 @@ async def read_root():
     message = f"Hello world! From FastAPI running on Uvicorn with Gunicorn. Using Python {version}"
     return {"message": message}
 
+@app.on_event("startup")
+def startup_event():
+    global team 
+    team = init_team(model_client)
 
 @app.get("/agent/")
 async def agent_call(query):
 
-    surfer = MultimodalWebSurfer(
-        "WebSurfer",
-        model_client=model_client,
-    )
+    response = await run_team(team, query)
 
-    team = MagenticOneGroupChat([surfer], model_client=model_client)
+    return response
 
-    stream = team.run_stream(task=query)
 
-    async for message in stream:
-        pass
-
-    return {"message": message.messages[-1].content}

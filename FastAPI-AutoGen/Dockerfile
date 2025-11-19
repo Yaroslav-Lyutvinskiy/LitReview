@@ -1,7 +1,7 @@
 FROM python:3.11
 
 
-WORKDIR /code
+WORKDIR /code/app
 
 RUN pip install playwright
 
@@ -19,4 +19,5 @@ RUN pip install --no-cache-dir --upgrade -r /code/requirements.txt
 COPY ./app /code/app
 
 
-CMD ["fastapi", "run", "app/main.py", "--port", "8086"]
+CMD ["fastapi", "run", "main.py", "--port", "8086"]
+
