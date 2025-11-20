@@ -13,7 +13,7 @@ openai_api_key = os.environ.get("OPENAI_API_KEY")
 from app.agents import init_team, run_team
 
 model_client = OpenAIChatCompletionClient(
-    model="gpt-4o",
+    model="o3-mini",
     api_key = openai_api_key
 )
 
