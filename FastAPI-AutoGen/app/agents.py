@@ -1,6 +1,6 @@
 from autogen_agentchat.agents import AssistantAgent
 from autogen_agentchat.conditions import TextMentionTermination
-from autogen_agentchat.teams import MagenticOneGroupChat
+from autogen_agentchat.teams import RoundRobinGroupChat
 from autogen_agentchat.ui import Console
 from autogen_core.tools import FunctionTool
 from autogen_ext.models.openai import OpenAIChatCompletionClient
@@ -11,7 +11,9 @@ import requests
 import os
 from pathlib import Path
 from openai import OpenAI
+from dotenv import load_dotenv
 import arxiv
+import ast 
 
 
 def s2_search(query: str, max_results: int = 2) -> list:  # type: ignore[type-arg]
@@ -72,11 +74,14 @@ def download_pdf_file(url: str) -> str:
         return None
 
 
-def arxiv_search(query: str, max_results: int = 2) -> list:  # type: ignore[type-arg]
+#def arxiv_search(query: str, max_results: int = 2, min_year: int = 2020, max_year: int = 2025) -> list:  # type: ignore[type-arg]
+async def arxiv_search(query: str, max_results: int = 2) -> list:  # type: ignore[type-arg]
     """
-    Search Arxiv for papers and return the results including abstracts.
+    Asynchronious function to search Arxiv for papers and return the results including abstracts and summary.
+    :param query: query to search in arxiv
+    :param max_results: maximum number of articles returned
+    :return: path to output markdown file
     """
-    import arxiv
 
     client = arxiv.Client(
         page_size=max_results,
@@ -84,6 +89,14 @@ def arxiv_search(query: str, max_results: int = 2) -> list:  # type: ignore[type
         num_retries=3
     )
     search = arxiv.Search(query=query, max_results=max_results, sort_by=arxiv.SortCriterion.Relevance)
+
+    summarizer_agent = AssistantAgent(
+        name="Summarizer_Agent",
+        model_client=model_client,
+        description="An agent that can summarize one scientific paper in a time. The paper is provided as title, list of authors, abstaract and full text. Summarization is to be builtin context of provided user query",
+        system_message="You are a helpful AI assistant. Summarize content of scientific paper provided in no more that 2000 words. For summary use literature review style. Provide references mentioned in the summary in correct format" +
+        "The paper is provided as title, list of authors, abstaract and full text. Summarization is to be built in context of provided user query",
+    )
 
     results = []
     for paper in client.results(search):
@@ -99,15 +112,24 @@ def arxiv_search(query: str, max_results: int = 2) -> list:  # type: ignore[type
                     md_result = md.convert(pdf_file).markdown
                 
             
-            results.append(
-                {
-                    "title": paper.title,
-                    "authors": [author.name for author in paper.authors],
-                    "published": paper.published.strftime("%Y-%m-%d"),
-                    "abstract": paper.summary,
-                    "full_text": md_result
-                }
+            paper = {
+                "title": paper.title,
+                "authors": [author.name for author in paper.authors],
+                "published": paper.published.strftime("%Y-%m-%d"),
+                "abstract": paper.summary,
+                "full_text":md_result,
+                "query": query    
+            }
+
+            paper_summary = await summarizer_agent.run(
+                task = f"Write a summary of provided article : {paper}",
             )
+            paper["summary"] = paper_summary.messages[-1].content
+            paper["full_text"] = None
+            await summarizer_agent.on_reset(None)
+
+            results.append(paper)
+            
         # except:
         #     # Here need to be some warning
         #     pass
@@ -122,56 +144,37 @@ def arxiv_search(query: str, max_results: int = 2) -> list:  # type: ignore[type
     return results
 
 
-s2_search_tool = FunctionTool(
-    s2_search, description="Search Semantic scholar for papers by keywords, returns found papers including abstracts"
-)
+model_client = None
 
-arxiv_search_tool = FunctionTool(
-    arxiv_search, description="Search Arxiv for papers related to a given topic, including abstracts"
-)
+def init_team(model_client_param):
 
+    global model_client 
+    model_client = model_client_param
 
-
-def init_team(model_client):
-    s2_search_agent = AssistantAgent(
-        name="Semantic_Scholar_Search_Agent",
-        tools=[s2_search_tool],
-        model_client=model_client,
-        description="An agent that can search Semantic scholar paper database using keywords related to given topic",
-        system_message="You are a helpful AI assistant. Solve tasks using your tools.",
+    arxiv_search_tool = FunctionTool(
+        arxiv_search, description="Search Arxiv for papers related to a given topic, including abstracts and summary"
     )
-    
+
     arxiv_search_agent = AssistantAgent(
         name="Arxiv_Search_Agent",
         tools=[arxiv_search_tool],
         model_client=model_client,
-        description="An agent that can search Arxiv for papers related to a given topic, including abstracts",
-        system_message="You are a helpful AI assistant. Solve tasks using your tools. Specifically, you can take into consideration the user's request and craft a search query that is most likely to return relevant academic papers.",
+        description="An agent that can search Arxiv for papers related to a given topic, including abstracts and summary",
+        system_message="You are a helpful AI assistant. Given the user input define the search topic for scientific articles in arxiv, and search arxive for the topic. return list of found articles and topic",
     )
-    
-    summarizer_agent = AssistantAgent(
-        name="Summarizer_Agent",
-        model_client=model_client,
-        description="An agent that can summarize one scientific paper in a time. The paper should be provided as title, list of authors, abstaract and full text. Summarization will be build in context of general task query",
-        system_message="You are a helpful AI assistant. Summarize content of scientific paper provided in no more that 2000 words. Build a summarization in context of goal of literature search",
-    )
-    
+
     report_agent = AssistantAgent(
         name="Report_Agent",
         model_client=model_client,
         description="Generate a report based on a given topic",
-        system_message="You are a helpful assistant. Your task is to synthesize data extracted into a high quality literature review including CORRECT references. You MUST write a final report that is formatted as a literature review with CORRECT references.  Your response should end with the word 'TERMINATE'",
+        system_message="You are a helpful assistant. Your task is to synthesize data extracted into a high quality literature review containing no more than 5000 words including CORRECT references. "+
+            "You MUST write a final report that is formatted as a literature review with CORRECT references. Your response should end with the word 'TERMINATE'"
     )
 
     termination = TextMentionTermination("TERMINATE")
-    team = MagenticOneGroupChat(
-        participants=[arxiv_search_agent, summarizer_agent, report_agent], 
-        termination_condition=termination,
-        model_client = model_client
-    )
+    team = RoundRobinGroupChat([arxiv_search_agent, report_agent], termination_condition=termination)
 
     return team
-
 
 
 async def run_team(team,query):
