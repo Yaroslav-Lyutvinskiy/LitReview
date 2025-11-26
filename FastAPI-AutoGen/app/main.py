@@ -21,7 +21,6 @@ model_client = OpenAIChatCompletionClient(
 version = f"{sys.version_info.major}.{sys.version_info.minor}"
 
 app = FastAPI()
-team = None
 
 
 @app.get("/")
@@ -31,13 +30,12 @@ async def read_root():
 
 @app.on_event("startup")
 def startup_event():
-    global team 
-    team = init_team(model_client)
+    init_team(model_client)
 
 @app.get("/agent/")
 async def agent_call(query):
 
-    response = await run_team(team, query)
+    response = await run_team(query)
 
     return response
 

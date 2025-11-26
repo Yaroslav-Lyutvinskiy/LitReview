@@ -15,37 +15,15 @@ from dotenv import load_dotenv
 import arxiv
 import ast 
 
+from dataclasses import dataclass
+from pydantic import BaseModel, Field 
+from typing import List, Optional, Any
+from autogen_core import AgentId, MessageContext, RoutedAgent, message_handler, SingleThreadedAgentRuntime
+from autogen_agentchat.messages import TextMessage
+import asyncio 
+import time
+from openai._exceptions import RateLimitError
 
-def s2_search(query: str, max_results: int = 2) -> list:  # type: ignore[type-arg]
-    """
-    Search Semantic scholar by keywords and return the results including abstracts.
-    """
-    from semanticscholar import SemanticScholar
-
-    sch = SemanticScholar()
-    
-    search = sch.search_paper(query=query, limit = max_results)
-
-    results = []
-    for paper in search.items:
-        try:
-            results.append(
-                {
-                    "title": paper.title,
-                    "authors": [author.name for author in paper.authors],
-                    "published": paper.publicationDate.strftime("%Y-%m-%d"),
-                    "abstract": paper.abstract,
-                    "pdf_url": paper.openAccessPdf["url"]
-                }
-            )
-        except:
-            continue
-
-    # # Write results to a file
-    # with open('s2_search_results.json', 'w') as f:
-    #     json.dump(results, f, indent=2)
-
-    return results
 
 def download_pdf_file(url: str) -> str:
     """
@@ -74,13 +52,40 @@ def download_pdf_file(url: str) -> str:
         return None
 
 
-#def arxiv_search(query: str, max_results: int = 2, min_year: int = 2020, max_year: int = 2025) -> list:  # type: ignore[type-arg]
-async def arxiv_search(query: str, max_results: int = 2) -> list:  # type: ignore[type-arg]
+@dataclass
+class Article(BaseModel):
+    title:str
+    authors:List[str]
+    published:str
+    abstract:Optional[str] = None
+    full_text_url:Optional[str] = None
+    full_text:Optional[str] = None
+    summary:Optional[str] = None
+    topic:Optional[str] = None
+    def __init__(self, title, authors, published, abstract, full_text_url, full_text = None, topic=None, summary = None):
+        super().__init__(title = title, authors = authors, published = published, abstract = abstract, full_text_url = full_text_url, full_text = full_text,  topic = topic, summary = summary)
+
+@dataclass
+class Articles(BaseModel):
+    articles:str
+    def __init__(self, articles:str):
+        super().__init__(articles = articles)
+    
+
+@dataclass
+class UserRequest(BaseModel):
+    request:str
+    def __init__(self, request:str):
+        super().__init__(request = request)
+
+
+
+def arxiv_search(query: str, max_results: int = 2) -> list[Article]:  # type: ignore[type-arg]
     """
-    Asynchronious function to search Arxiv for papers and return the results including abstracts and summary.
+    Search Arxiv for papers and return the results including abstracts and full text.
     :param query: query to search in arxiv
     :param max_results: maximum number of articles returned
-    :return: path to output markdown file
+    :return: list of found papers
     """
 
     client = arxiv.Client(
@@ -90,99 +95,183 @@ async def arxiv_search(query: str, max_results: int = 2) -> list:  # type: ignor
     )
     search = arxiv.Search(query=query, max_results=max_results, sort_by=arxiv.SortCriterion.Relevance)
 
-    summarizer_agent = AssistantAgent(
-        name="Summarizer_Agent",
-        model_client=model_client,
-        description="An agent that can summarize one scientific paper in a time. The paper is provided as title, list of authors, abstaract and full text. Summarization is to be builtin context of provided user query",
-        system_message="You are a helpful AI assistant. Summarize content of scientific paper provided in no more that 2000 words. For summary use literature review style. Provide references mentioned in the summary in correct format" +
-        "The paper is provided as title, list of authors, abstaract and full text. Summarization is to be built in context of provided user query",
-    )
-
     results = []
+    
     for paper in client.results(search):
 
-        try:
-
-            #extract full text
-            md_result = None
-            if paper.pdf_url is not None : 
-                pdf_file =  download_pdf_file(paper.pdf_url)
-                if pdf_file is not None : 
-                    md = MarkItDown()
-                    md_result = md.convert(pdf_file).markdown
-                
-            
-            paper = {
-                "title": paper.title,
-                "authors": [author.name for author in paper.authors],
-                "published": paper.published.strftime("%Y-%m-%d"),
-                "abstract": paper.summary,
-                "full_text":md_result,
-                "query": query    
-            }
-
-            paper_summary = await summarizer_agent.run(
-                task = f"Write a summary of provided article : {paper}",
-            )
-            paper["summary"] = paper_summary.messages[-1].content
-            paper["full_text"] = None
-            await summarizer_agent.on_reset(None)
-
-            results.append(paper)
-            
-        # except:
-        #     # Here need to be some warning
-        #     pass
-        finally:
-            if pdf_file is not None:
-                os.remove(pdf_file)
-
-    # # Write results to a file
-    # with open('arxiv_search_results.json', 'w') as f:
-    #     json.dump(results, f, indent=2)
+        article =  Article(
+            title = paper.title, 
+            authors = [author.name for author in paper.authors],
+            published = paper.published.strftime("%Y-%m-%d"),
+            abstract = paper.summary,
+            full_text_url = paper.pdf_url,
+            summary = None
+        )
+        results.append(article)
 
     return results
 
+class ArxivSearchAgent(RoutedAgent):
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        global model_client
+        self._delegate = AssistantAgent(
+            name, 
+            model_client=model_client,
+            tools=[arxiv_search_tool],
+            description="An agent that can search Arxiv for papers related to a given topic, including abstracts and full text",
+            system_message="You are a helpful AI assistant. Solve tasks using your tools. Specifically, you can take into consideration the user's request and craft a search query that is most likely to return relevant academic papers.",
+        )
+
+    @message_handler
+    async def handle_my_message_type(self, message: UserRequest, ctx: MessageContext) -> Any:
+        response = await self._delegate.on_messages(
+            [TextMessage(content=message.request, source="user")], 
+            ctx.cancellation_token
+        )
+        
+        s = response.chat_message.results[0].content
+        safe_globals = {"Article": Article}
+        articles = eval(s, safe_globals, {})    
+        
+        counter = 0 
+        waities = []
+        #loop = asyncio.get_event_loop()
+
+        finished = []
+        for article in articles:
+            agent_name = "Summarizer"+str(counter)
+            try:
+                agent = await runtime.agent_metadata(AgentId.from_str(agent_name+"/default"))
+            except:
+                await SummarizerAgent.register(runtime, agent_name, lambda: SummarizerAgent(agent_name))
+            #finished.append(await  self.send_message(article, AgentId(agent_name, "default")))
+            waities.append(asyncio.create_task(self.send_message(article,AgentId(agent_name, "default"))))
+            
+        finished, unfinished = await asyncio.wait(waities, timeout=1200)
+        print(finished)
+
+        #processing of finished tasks
+        articles_with_summary = []
+        for task in list(finished):
+            if (task.done()  and task.exception() is None):
+                articles_with_summary.append(task.result())
+
+        if len(articles_with_summary) == 0:
+            return "No articles available"
+
+        report = await self.send_message(Articles(articles=str(articles_with_summary)),AgentId("ReporterAgent", "default"))
+
+        return report
+
+
+class SummarizerAgent(RoutedAgent):
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        global model_client
+        self._delegate = AssistantAgent(
+            name, 
+            model_client=model_client,
+            description="An agent summarizes a scientific paper. The paper is provided as title, list of authors, abstaract and full text. Summarization is to be builtin context of provided user query",
+            system_message="You are a helpful AI assistant. Summarize content of scientific paper provided in no more than 1500 words. For summary use literature review style. Keep key references and provide references mentioned in the summary in correct format in last 'References' section" +
+            "The paper is provided as title, list of authors, abstaract and full text.",
+       )
+
+    @message_handler
+    async def handle_article(self, message: Article, ctx: MessageContext) -> Article:
+        pdf_file = None
+        try:
+            #extract full text
+            md_result = None
+            if message.full_text_url is not None : 
+                pdf_file =  download_pdf_file(message.full_text_url)
+                if pdf_file is not None : 
+                    md = MarkItDown()
+                    md_result = md.convert(pdf_file).markdown
+                    message.full_text = md_result
+
+            counter = 0; 
+            while True:
+                try:
+                    response = await self._delegate.on_messages(
+                        [TextMessage(content=str(message), source="Summarizer")], 
+                        ctx.cancellation_token
+                    )
+                    counter += 1
+                except RateLimitError as error:
+                    print(f"Rate Limit on {message.full_text_url}, error - : {error}")
+                    ## Yes it is not mistake - we need to sleep everything to acheve reset of RateLimit on OpenAI
+                    await asyncio.sleep(30+60*counter)
+                except:
+                    pass
+                else:
+                    print(f"Article {message.full_text_url} has been processed")
+                    break
+            
+            message.summary = response.chat_message.content
+            message.full_text = None
+        # except:
+        finally:
+            if pdf_file is not None:
+                os.remove(pdf_file)
+        return message
+    
+
+class ReporterAgent(RoutedAgent):
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        global model_client
+        self._delegate = AssistantAgent(
+            name, 
+            model_client=model_client,
+            description="Generate a report based on a given topic",
+            system_message="You are a helpful assistant. Your task is to synthesize data extracted into a high quality literature review containing no more than 5000 words including CORRECT references. "+
+                "You MUST write a final report that is formatted as a literature review with CORRECT references.",
+       )
+
+   
+    @message_handler
+    async def handle_articles(self, message: Articles, ctx: MessageContext) -> Any:
+        counter = 0; 
+        while True:
+            try:
+                counter += 1
+                response = await self._delegate.on_messages(
+                    [TextMessage(content=message.articles, source="Reporter")], 
+                    ctx.cancellation_token)
+            except RateLimitError as error:
+                print(f"Rate Limit on report, error - : {error}")
+                await asyncio.sleep(30+60*counter)
+            except:
+                pass
+            else:
+                break
+        
+        return response 
+
+
 
 model_client = None
+runtime = None
 
 def init_team(model_client_param):
 
     global model_client 
     model_client = model_client_param
 
-    arxiv_search_tool = FunctionTool(
-        arxiv_search, description="Search Arxiv for papers related to a given topic, including abstracts and summary"
-    )
-
-    arxiv_search_agent = AssistantAgent(
-        name="Arxiv_Search_Agent",
-        tools=[arxiv_search_tool],
-        model_client=model_client,
-        description="An agent that can search Arxiv for papers related to a given topic, including abstracts and summary",
-        system_message="You are a helpful AI assistant. Given the user input define the search topic for scientific articles in arxiv, and search arxive for the topic. return list of found articles and topic",
-    )
-
-    report_agent = AssistantAgent(
-        name="Report_Agent",
-        model_client=model_client,
-        description="Generate a report based on a given topic",
-        system_message="You are a helpful assistant. Your task is to synthesize data extracted into a high quality literature review containing no more than 5000 words including CORRECT references. "+
-            "You MUST write a final report that is formatted as a literature review with CORRECT references. Your response should end with the word 'TERMINATE'"
-    )
-
-    termination = TextMentionTermination("TERMINATE")
-    team = RoundRobinGroupChat([arxiv_search_agent, report_agent], termination_condition=termination)
-
-    return team
+    global runtime
+    runtime = SingleThreadedAgentRuntime()
+    await ArxivSearchAgent.register(runtime, "SearchAgent", lambda: ArxivSearchAgent("SearchAgent"))
+    await ReporterAgent.register(runtime, "ReporterAgent", lambda: ReporterAgent("ReporterAgent"))
 
 
-async def run_team(team,query):
+    return 
+
+
+async def run_team(query):
     
-    stream = team.run_stream(task=query)
+    response = await runtime.send_message(
+        UserRequest(request = query), AgentId("SearchAgent", "default"))
 
-    async for message in stream:
-        pass
-
-    return {"message": message.messages[-1].content}
+    return {"message": response.chat_message.content}
 
