@@ -3,12 +3,16 @@ import sys
 from fastapi import FastAPI
 from dotenv import load_dotenv
 import os
+import logging
 
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 
 
+
 load_dotenv("./.env")
 openai_api_key = os.environ.get("OPENAI_API_KEY")
+
+
 
 from app.agents import init_team, run_team
 
@@ -29,12 +33,12 @@ async def read_root():
     return {"message": message}
 
 @app.on_event("startup")
-def startup_event():
-    init_team(model_client)
+async def startup_event():
+    await init_team(model_client)
 
 @app.get("/agent/")
 async def agent_call(query):
-
+    logger.debug(query)
     response = await run_team(query)
 
     return response

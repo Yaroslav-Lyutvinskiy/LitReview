@@ -24,6 +24,12 @@ import asyncio
 import time
 from openai._exceptions import RateLimitError
 
+# that is constat which limits number of llm sessions run in parallel 
+# for Tier1 of OpenAI account limit of tokens per minute is set to 200 000 tokens 
+# it fits 3 average articles therefore concurent_sessions limit is 3 
+# if you have higher tier you can try to increase this constant 
+concurent_sessions = 3
+
 
 def download_pdf_file(url: str) -> str:
     """
@@ -67,9 +73,10 @@ class Article(BaseModel):
 
 @dataclass
 class Articles(BaseModel):
+    topic:str
     articles:str
-    def __init__(self, articles:str):
-        super().__init__(articles = articles)
+    def __init__(self, articles:str, topic:str):
+        super().__init__(articles = articles, topic = topic)
     
 
 @dataclass
@@ -111,6 +118,7 @@ def arxiv_search(query: str, max_results: int = 2) -> list[Article]:  # type: ig
 
     return results
 
+
 class ArxivSearchAgent(RoutedAgent):
     def __init__(self, name: str) -> None:
         super().__init__(name)
@@ -125,6 +133,9 @@ class ArxivSearchAgent(RoutedAgent):
 
     @message_handler
     async def handle_my_message_type(self, message: UserRequest, ctx: MessageContext) -> Any:
+
+        global concurent_sessions
+        
         response = await self._delegate.on_messages(
             [TextMessage(content=message.request, source="user")], 
             ctx.cancellation_token
@@ -134,36 +145,58 @@ class ArxivSearchAgent(RoutedAgent):
         safe_globals = {"Article": Article}
         articles = eval(s, safe_globals, {})    
         
-        counter = 0 
+        article_count = 0 
+       
         waities = []
-        #loop = asyncio.get_event_loop()
-
-        finished = []
-        for article in articles:
-            agent_name = "Summarizer"+str(counter)
-            try:
-                agent = await runtime.agent_metadata(AgentId.from_str(agent_name+"/default"))
-            except:
-                await SummarizerAgent.register(runtime, agent_name, lambda: SummarizerAgent(agent_name))
-            #finished.append(await  self.send_message(article, AgentId(agent_name, "default")))
-            waities.append(asyncio.create_task(self.send_message(article,AgentId(agent_name, "default"))))
-            
-        finished, unfinished = await asyncio.wait(waities, timeout=1200)
-        print(finished)
-
-        #processing of finished tasks
+        waited_articles = []
         articles_with_summary = []
-        for task in list(finished):
-            if (task.done()  and task.exception() is None):
-                articles_with_summary.append(task.result())
+        
+        while article_count < len(articles):
+            waities = []
+            for i in range(concurent_sessions):
+                article = articles[article_count]
+                    
+                agent_name = "Summarizer"+str(i)
+                try:
+                    agent = await runtime.agent_metadata(AgentId.from_str(agent_name+"/default"))
+                except:
+                    await SummarizerAgent.register(runtime, agent_name, lambda: SummarizerAgent(agent_name))
+                    
+                waities.append(asyncio.create_task(self.send_message(article,AgentId(agent_name, "default"))))
+                
+                print(f"{article.full_text_url} has been sent for processing")
 
+                article_count += 1
+                if article_count >= len(articles):
+                    break
+
+            finished, unfinished = await asyncio.wait(waities, timeout=300)
+
+            rate_limit_flag = False
+            for task in list(finished):
+                if (task.done()  and task.exception() is None):
+                    articles_with_summary.append(task.result())
+                    #if article correctly processed - 
+                    waited_articles = list(filter(lambda x : task.result().full_text_url != x.full_text_url ,waited_articles))
+                if isinstance(task.exception(),RateLimitError):
+                    print(f"again!! {task.exception()}")
+                    rate_limit_flag = True
+                    if concurent_sessions > 1:
+                        concurent_sessions -= 1
+
+            if rate_limit_flag :
+                await asyncio.sleep(120)
+
+            if len(waited_articles) > 0 : 
+                print(f"{len(waited_articles)} articles need to be reprocessed")
+                articles = articles + waited_articles
+        
         if len(articles_with_summary) == 0:
             return "No articles available"
 
-        report = await self.send_message(Articles(articles=str(articles_with_summary)),AgentId("ReporterAgent", "default"))
+        report = await self.send_message(Articles(articles=str(articles_with_summary), topic = message.request),AgentId("ReporterAgent", "default"))
 
         return report
-
 
 class SummarizerAgent(RoutedAgent):
     def __init__(self, name: str) -> None:
@@ -179,6 +212,7 @@ class SummarizerAgent(RoutedAgent):
 
     @message_handler
     async def handle_article(self, message: Article, ctx: MessageContext) -> Article:
+        global excep
         pdf_file = None
         try:
             #extract full text
@@ -199,11 +233,13 @@ class SummarizerAgent(RoutedAgent):
                     )
                     counter += 1
                 except RateLimitError as error:
-                    print(f"Rate Limit on {message.full_text_url}, error - : {error}")
+                    print(f"Summarizer: Rate Limit on {message.full_text_url}, error - : {error}")
                     ## Yes it is not mistake - we need to sleep everything to acheve reset of RateLimit on OpenAI
-                    await asyncio.sleep(30+60*counter)
+                    # time.sleep(180)
+                    # await asyncio.sleep(30)
+                    raise
                 except:
-                    pass
+                    raise
                 else:
                     print(f"Article {message.full_text_url} has been processed")
                     break
@@ -216,6 +252,7 @@ class SummarizerAgent(RoutedAgent):
                 os.remove(pdf_file)
         return message
     
+    
 
 class ReporterAgent(RoutedAgent):
     def __init__(self, name: str) -> None:
@@ -226,12 +263,13 @@ class ReporterAgent(RoutedAgent):
             model_client=model_client,
             description="Generate a report based on a given topic",
             system_message="You are a helpful assistant. Your task is to synthesize data extracted into a high quality literature review containing no more than 5000 words including CORRECT references. "+
-                "You MUST write a final report that is formatted as a literature review with CORRECT references.",
+                "The review must be dedicated to provided topic. You MUST write a final report that is formatted as a literature review with CORRECT references.",
        )
 
    
     @message_handler
     async def handle_articles(self, message: Articles, ctx: MessageContext) -> Any:
+        global excep
         counter = 0; 
         while True:
             try:
@@ -241,7 +279,7 @@ class ReporterAgent(RoutedAgent):
                     ctx.cancellation_token)
             except RateLimitError as error:
                 print(f"Rate Limit on report, error - : {error}")
-                await asyncio.sleep(30+60*counter)
+                await asyncio.sleep(120)
             except:
                 pass
             else:
@@ -254,7 +292,7 @@ class ReporterAgent(RoutedAgent):
 model_client = None
 runtime = None
 
-def init_team(model_client_param):
+async def init_team(model_client_param):
 
     global model_client 
     model_client = model_client_param
@@ -263,7 +301,6 @@ def init_team(model_client_param):
     runtime = SingleThreadedAgentRuntime()
     await ArxivSearchAgent.register(runtime, "SearchAgent", lambda: ArxivSearchAgent("SearchAgent"))
     await ReporterAgent.register(runtime, "ReporterAgent", lambda: ReporterAgent("ReporterAgent"))
-
 
     return 
 
