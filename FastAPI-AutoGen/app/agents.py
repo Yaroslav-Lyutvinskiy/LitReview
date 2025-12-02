@@ -119,6 +119,11 @@ def arxiv_search(query: str, max_results: int = 2) -> list[Article]:  # type: ig
     return results
 
 
+arxiv_search_tool = FunctionTool(
+    arxiv_search, description="Search Arxiv for papers related to a given topic, including abstracts and summary"
+)
+
+
 class ArxivSearchAgent(RoutedAgent):
     def __init__(self, name: str) -> None:
         super().__init__(name)
@@ -301,11 +306,14 @@ async def init_team(model_client_param):
     runtime = SingleThreadedAgentRuntime()
     await ArxivSearchAgent.register(runtime, "SearchAgent", lambda: ArxivSearchAgent("SearchAgent"))
     await ReporterAgent.register(runtime, "ReporterAgent", lambda: ReporterAgent("ReporterAgent"))
+    runtime.start()
 
     return 
 
 
 async def run_team(query):
+
+    global runtime
     
     response = await runtime.send_message(
         UserRequest(request = query), AgentId("SearchAgent", "default"))

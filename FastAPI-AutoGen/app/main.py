@@ -38,7 +38,7 @@ async def startup_event():
 
 @app.get("/agent/")
 async def agent_call(query):
-    logger.debug(query)
+    #logger.debug(query)
     response = await run_team(query)
 
     return response

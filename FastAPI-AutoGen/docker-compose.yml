@@ -1,0 +1,9 @@
+services:
+  api:
+    build: .
+    container_name: "fast_agent"
+    volumes:
+      - ./app:/app
+    ports:
+    - 8086:8086
+    - 5678:5678
