@@ -67,18 +67,17 @@ class Article(BaseModel):
     full_text_url:Optional[str] = None
     full_text:Optional[str] = None
     summary:Optional[str] = None
-    topic:Optional[str] = None
-    def __init__(self, title, authors, published, abstract, full_text_url, full_text = None, topic=None, summary = None):
-        super().__init__(title = title, authors = authors, published = published, abstract = abstract, full_text_url = full_text_url, full_text = full_text,  topic = topic, summary = summary)
+    # topic:Optional[str] = None
+    def __init__(self, title, authors, published, abstract, full_text_url, full_text, summary):#, full_text = None, topic=None, summary = None):
+        super().__init__(title = title, authors = authors, published = published, abstract = abstract, full_text_url = full_text_url, full_text = full_text , summary = summary)#, full_text = full_text,  topic = topic, summary = summary)
 
 @dataclass
 class Articles(BaseModel):
     topic:str
-    articles:str
-    def __init__(self, articles:str, topic:str):
+    articles:List[Article]
+    def __init__(self, articles:List[Article], topic:str):
         super().__init__(articles = articles, topic = topic)
     
-
 @dataclass
 class UserRequest(BaseModel):
     request:str
@@ -87,7 +86,7 @@ class UserRequest(BaseModel):
 
 
 
-def arxiv_search(query: str, max_results: int = 2) -> list[Article]:  # type: ignore[type-arg]
+def arxiv_search(query: str, max_results: int) -> list[Article]:  # type: ignore[type-arg]
     """
     Search Arxiv for papers and return the results including abstracts and full text.
     :param query: query to search in arxiv
@@ -112,17 +111,24 @@ def arxiv_search(query: str, max_results: int = 2) -> list[Article]:  # type: ig
             published = paper.published.strftime("%Y-%m-%d"),
             abstract = paper.summary,
             full_text_url = paper.pdf_url,
+            full_text = None,
             summary = None
         )
+        print(article.full_text_url)
         results.append(article)
 
     return results
 
-
 arxiv_search_tool = FunctionTool(
-    arxiv_search, description="Search Arxiv for papers related to a given topic, including abstracts and summary"
+    arxiv_search, description="Search Arxiv for papers related to a given topic, including abstracts and summary",
+    strict=True
 )
 
+# that is constat which limits number of llm sessions run in parallel 
+# for Tier1 of OpenAI account limit of tokens per minute is set to 200 000 tokens 
+# it fits 3 average articles therefore concurent_sessions limit is 3 
+# if you have higher tier you can try to increase this constant 
+concurent_sessions = 3
 
 class ArxivSearchAgent(RoutedAgent):
     def __init__(self, name: str) -> None:
@@ -132,8 +138,10 @@ class ArxivSearchAgent(RoutedAgent):
             name, 
             model_client=model_client,
             tools=[arxiv_search_tool],
+            output_content_type=Articles,
             description="An agent that can search Arxiv for papers related to a given topic, including abstracts and full text",
-            system_message="You are a helpful AI assistant. Solve tasks using your tools. Specifically, you can take into consideration the user's request and craft a search query that is most likely to return relevant academic papers.",
+            system_message="You are a helpful AI assistant. Solve tasks using your tools. Specifically, you can take into consideration the user's request and craft a search query that is most likely to return relevant academic papers. " +
+                "Return 'Articles' object with list of Article objects exactly as it returned by arxiv_search_tool and 'topic' as crafted search query used to retrieve articles. Don't fill summary and full_text properties of Article objects",
         )
 
     @message_handler
@@ -145,23 +153,25 @@ class ArxivSearchAgent(RoutedAgent):
             [TextMessage(content=message.request, source="user")], 
             ctx.cancellation_token
         )
-        
-        s = response.chat_message.results[0].content
-        safe_globals = {"Article": Article}
-        articles = eval(s, safe_globals, {})    
-        
+
+        articles = response.chat_message.content.articles
         article_count = 0 
-       
+
+        print(articles)
+        
         waities = []
         waited_articles = []
         articles_with_summary = []
         
         while article_count < len(articles):
             waities = []
+                
             for i in range(concurent_sessions):
+                
                 article = articles[article_count]
                     
                 agent_name = "Summarizer"+str(i)
+
                 try:
                     agent = await runtime.agent_metadata(AgentId.from_str(agent_name+"/default"))
                 except:
@@ -177,12 +187,15 @@ class ArxivSearchAgent(RoutedAgent):
 
             finished, unfinished = await asyncio.wait(waities, timeout=300)
 
+            print(finished)
+
             rate_limit_flag = False
             for task in list(finished):
                 if (task.done()  and task.exception() is None):
                     articles_with_summary.append(task.result())
                     #if article correctly processed - 
                     waited_articles = list(filter(lambda x : task.result().full_text_url != x.full_text_url ,waited_articles))
+                    print(waited_articles)
                 if isinstance(task.exception(),RateLimitError):
                     print(f"again!! {task.exception()}")
                     rate_limit_flag = True
@@ -199,9 +212,10 @@ class ArxivSearchAgent(RoutedAgent):
         if len(articles_with_summary) == 0:
             return "No articles available"
 
-        report = await self.send_message(Articles(articles=str(articles_with_summary), topic = message.request),AgentId("ReporterAgent", "default"))
+        report = await self.send_message(Articles(articles=articles_with_summary, topic = message.request),AgentId("ReporterAgent", "default"))
 
         return report
+
 
 class SummarizerAgent(RoutedAgent):
     def __init__(self, name: str) -> None:
@@ -217,7 +231,6 @@ class SummarizerAgent(RoutedAgent):
 
     @message_handler
     async def handle_article(self, message: Article, ctx: MessageContext) -> Article:
-        global excep
         pdf_file = None
         try:
             #extract full text
@@ -230,28 +243,19 @@ class SummarizerAgent(RoutedAgent):
                     message.full_text = md_result
 
             counter = 0; 
-            while True:
-                try:
-                    response = await self._delegate.on_messages(
-                        [TextMessage(content=str(message), source="Summarizer")], 
-                        ctx.cancellation_token
-                    )
-                    counter += 1
-                except RateLimitError as error:
-                    print(f"Summarizer: Rate Limit on {message.full_text_url}, error - : {error}")
-                    ## Yes it is not mistake - we need to sleep everything to acheve reset of RateLimit on OpenAI
-                    # time.sleep(180)
-                    # await asyncio.sleep(30)
-                    raise
-                except:
-                    raise
-                else:
-                    print(f"Article {message.full_text_url} has been processed")
-                    break
-            
+            try:
+                response = await self._delegate.on_messages(
+                    [TextMessage(content=str(message), source="Summarizer")], 
+                    ctx.cancellation_token
+                )
+                counter += 1
+            except RateLimitError as error:
+                print(f"Summarizer: Rate Limit on {message.full_text_url}, error - : {error}")
+                raise
+            else:
+                print(f"Article {message.full_text_url} has been processed")
             message.summary = response.chat_message.content
             message.full_text = None
-        # except:
         finally:
             if pdf_file is not None:
                 os.remove(pdf_file)
@@ -280,18 +284,15 @@ class ReporterAgent(RoutedAgent):
             try:
                 counter += 1
                 response = await self._delegate.on_messages(
-                    [TextMessage(content=message.articles, source="Reporter")], 
+                    [TextMessage(content=str(message), source="Reporter")], 
                     ctx.cancellation_token)
             except RateLimitError as error:
                 print(f"Rate Limit on report, error - : {error}")
                 await asyncio.sleep(120)
-            except:
-                pass
             else:
                 break
         
         return response 
-
 
 
 model_client = None
