@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 from typing import List, Optional, Any
 from autogen_core import AgentId, MessageContext, RoutedAgent, message_handler, SingleThreadedAgentRuntime
 from autogen_agentchat.messages import TextMessage
+from autogen_core.models import UserMessage
 import asyncio 
 import time
 from openai._exceptions import RateLimitError
@@ -187,8 +188,6 @@ class ArxivSearchAgent(RoutedAgent):
 
             finished, unfinished = await asyncio.wait(waities, timeout=300)
 
-            print(finished)
-
             rate_limit_flag = False
             for task in list(finished):
                 if (task.done()  and task.exception() is None):
@@ -216,18 +215,15 @@ class ArxivSearchAgent(RoutedAgent):
 
         return report
 
-
 class SummarizerAgent(RoutedAgent):
     def __init__(self, name: str) -> None:
         super().__init__(name)
         global model_client
-        self._delegate = AssistantAgent(
-            name, 
-            model_client=model_client,
-            description="An agent summarizes a scientific paper. The paper is provided as title, list of authors, abstaract and full text. Summarization is to be builtin context of provided user query",
-            system_message="You are a helpful AI assistant. Summarize content of scientific paper provided in no more than 1500 words. For summary use literature review style. Keep key references and provide references mentioned in the summary in correct format in last 'References' section" +
-            "The paper is provided as title, list of authors, abstaract and full text.",
-       )
+        self._model_client=model_client
+        self._name = name
+        self._system_message=("You are a helpful AI assistant. Summarize content of scientific paper provided in no more than 1500 words. "+
+            "For summary use literature review style. Keep key references and provide references mentioned in the summary in correct format in last 'References' section. " +
+            "The paper is provided as title, list of authors, abstaract and full text.")
 
     @message_handler
     async def handle_article(self, message: Article, ctx: MessageContext) -> Article:
@@ -244,17 +240,22 @@ class SummarizerAgent(RoutedAgent):
 
             counter = 0; 
             try:
-                response = await self._delegate.on_messages(
-                    [TextMessage(content=str(message), source="Summarizer")], 
-                    ctx.cancellation_token
+                response = await self._model_client.create(
+                     [UserMessage(
+                         content= self._system_message + str(message),
+                         source= self._name
+                     )]
                 )
                 counter += 1
             except RateLimitError as error:
                 print(f"Summarizer: Rate Limit on {message.full_text_url}, error - : {error}")
                 raise
+            except Exception as error:
+                print(f"Summarizer: error - : {error}")
+                raise
             else:
                 print(f"Article {message.full_text_url} has been processed")
-            message.summary = response.chat_message.content
+            message.summary = response.content
             message.full_text = None
         finally:
             if pdf_file is not None:
@@ -262,30 +263,29 @@ class SummarizerAgent(RoutedAgent):
         return message
     
     
+    
 
 class ReporterAgent(RoutedAgent):
     def __init__(self, name: str) -> None:
         super().__init__(name)
         global model_client
-        self._delegate = AssistantAgent(
-            name, 
-            model_client=model_client,
-            description="Generate a report based on a given topic",
-            system_message="You are a helpful assistant. Your task is to synthesize data extracted into a high quality literature review containing no more than 5000 words including CORRECT references. "+
-                "The review must be dedicated to provided topic. You MUST write a final report that is formatted as a literature review with CORRECT references.",
-       )
-
+        self._name = name
+        self._model_client = model_client
+        self._system_message=("You are a helpful assistant. Your task is to synthesize data extracted into a high quality literature review containing no more than 5000 words including CORRECT references. "+
+            "The review must be dedicated to provided topic. You MUST write a final report that is formatted as a literature review with CORRECT references.")
    
     @message_handler
     async def handle_articles(self, message: Articles, ctx: MessageContext) -> Any:
-        global excep
         counter = 0; 
         while True:
             try:
                 counter += 1
-                response = await self._delegate.on_messages(
-                    [TextMessage(content=str(message), source="Reporter")], 
-                    ctx.cancellation_token)
+                response = await self._model_client.create(
+                     [UserMessage(
+                         content= self._system_message + str(message),
+                         source= self._name
+                     )]
+                )
             except RateLimitError as error:
                 print(f"Rate Limit on report, error - : {error}")
                 await asyncio.sleep(120)
@@ -319,5 +319,5 @@ async def run_team(query):
     response = await runtime.send_message(
         UserRequest(request = query), AgentId("SearchAgent", "default"))
 
-    return {"message": response.chat_message.content}
+    return {"message": response.content}
 
