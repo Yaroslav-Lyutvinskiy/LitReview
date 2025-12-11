@@ -86,21 +86,19 @@ class UserRequest(BaseModel):
         super().__init__(request = request)
 
 
-
-def arxiv_search(query: str, max_results: int) -> list[Article]:  # type: ignore[type-arg]
+def arxiv_search(query: str) -> list[Article]:  # type: ignore[type-arg]
     """
     Search Arxiv for papers and return the results including abstracts and full text.
     :param query: query to search in arxiv
-    :param max_results: maximum number of articles returned
     :return: list of found papers
     """
 
     client = arxiv.Client(
-        page_size=max_results,
+        page_size=100,
         delay_seconds=5,
         num_retries=3
     )
-    search = arxiv.Search(query=query, max_results=max_results, sort_by=arxiv.SortCriterion.Relevance)
+    search = arxiv.Search(query=query, max_results=100, sort_by=arxiv.SortCriterion.Relevance)
 
     results = []
     
@@ -115,10 +113,11 @@ def arxiv_search(query: str, max_results: int) -> list[Article]:  # type: ignore
             full_text = None,
             summary = None
         )
-        print(article.full_text_url)
+        print(article.title)
         results.append(article)
 
     return results
+    
 
 arxiv_search_tool = FunctionTool(
     arxiv_search, description="Search Arxiv for papers related to a given topic, including abstracts and summary",
@@ -140,9 +139,12 @@ class ArxivSearchAgent(RoutedAgent):
             model_client=model_client,
             tools=[arxiv_search_tool],
             output_content_type=Articles,
-            description="An agent that can search Arxiv for papers related to a given topic, including abstracts and full text",
-            system_message="You are a helpful AI assistant. Solve tasks using your tools. Specifically, you can take into consideration the user's request and craft a search query that is most likely to return relevant academic papers. " +
-                "Return 'Articles' object with list of Article objects exactly as it returned by arxiv_search_tool and 'topic' as crafted search query used to retrieve articles. Don't fill summary and full_text properties of Article objects",
+            description="An agent that can search Arxiv for papers related to a given topic, including abstracts",
+            system_message=("You are a helpful AI assistant. Solve tasks using your tools. Specifically, you can take into consideration the user's request and craft a search query that is most likely to return relevant academic papers. " +
+                            "Let number_of_articles be a number of articles to fulfill user request. If such a number is not explicitly specified in user request, make reasonable guess on number_of_articles needed to fulfill user request. "+
+                            "After search, check the articles title and abstract for semantic relevance to crafted search query and user request, after that, select for the output no more than number_of_articles most relevant article records. "+
+                            "Return 'Articles' object with list of selected Article objects exactly as it returned by arxiv_search_tool and 'topic' as crafted search query used to retrieve articles. "+
+                            "Don't fill summary and full_text properties of Article objects"),
         )
 
     @message_handler
@@ -158,11 +160,11 @@ class ArxivSearchAgent(RoutedAgent):
         articles = response.chat_message.content.articles
         article_count = 0 
 
-        print(articles)
-        
         waities = []
         waited_articles = []
         articles_with_summary = []
+
+        print("Selected: ")
         
         while article_count < len(articles):
             waities = []
@@ -180,7 +182,7 @@ class ArxivSearchAgent(RoutedAgent):
                     
                 waities.append(asyncio.create_task(self.send_message(article,AgentId(agent_name, "default"))))
                 
-                print(f"{article.full_text_url} has been sent for processing")
+                print(f"{article.title} on {article.full_text_url} has been sent for processing")
 
                 article_count += 1
                 if article_count >= len(articles):
